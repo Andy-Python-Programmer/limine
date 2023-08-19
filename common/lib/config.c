@@ -135,13 +135,162 @@ static struct menu_entry *create_menu_tree(struct menu_entry *parent,
 
 struct menu_entry *menu_tree = NULL;
 
+bool isalpha(char c) {
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+bool isdigit(char c) {
+	return (c >= '0' && c <= '9');
+}
+
+bool isalnum(char c) {
+    return isalpha(c) || isdigit(c);
+}
+
+char *strchr(const char *string, int c) {
+    do {
+        if (*string == c) return (char *)string;
+    } while (*string++);
+
+    return NULL;
+}
+
+char *string_new() {
+    char *ret = (char *)ext_mem_alloc(sizeof(char));
+    *ret = 0;
+    return ret;
+}
+
+void string_push(char **self, char *value) {
+    size_t old_len = strlen(*self);
+    size_t value_len = strlen(value);
+    
+    char *ret = (char*)ext_mem_alloc(old_len + value_len + 1);
+
+    memcpy(ret, *self, old_len);
+    memcpy(ret + old_len, value, value_len);
+    ret[old_len + value_len] = 0;
+
+    *self = ret;
+}
+
 struct macro {
-    char name[1024];
-    char value[2048];
+    char name[4096];
+    char value[4096];
     struct macro *next;
 };
 
-static struct macro *macros = NULL;
+struct preprocessor_state {
+    char *target;
+    char *result;
+    struct macro *macros;
+};
+
+bool preprocess_eat(struct preprocessor_state *state, char token) {
+    do {
+        char tok = *state->target;
+        char c[] = { tok, 0 };
+
+        if (tok == token) {
+            state->target++;
+            return true;
+        }
+
+        string_push(&state->result, c);
+    } while (*(state->target)++);
+
+    return false;
+}
+
+char *preprocess_ident(struct preprocessor_state *state) {
+    char *ident = state->target;
+    while (state->target[0]) {
+        char token = state->target[0];
+        if (isalnum(token) || (token & 0x80) || token == '_' || token == '$' || token == '/' || token == ':' || token == '.') {
+            state->target++;
+            continue;
+        }
+
+        break;
+    }
+
+    size_t ident_len = state->target - ident;
+    if (ident_len == 0) {
+        return NULL;
+    }
+
+    char *ident_str = (char *)ext_mem_alloc(ident_len + 1);
+    memcpy(ident_str, ident, ident_len);
+    ident_str[ident_len] = 0;
+
+    return ident_str;
+}
+
+/// The caller is responsible for deallocating the returned string (via `pmm_free`).
+char *preprocess(char *target) {
+    size_t target_len = strlen(target);
+    struct preprocessor_state state = {
+        .target = target,
+        .result = string_new(),
+        .macros = ext_mem_alloc(sizeof(struct macro))
+    };
+
+    strcpy(state.macros->name, "ARCH");
+    strcpy(state.macros->value, "x86_64");
+    state.macros->next = NULL;
+
+    struct macro *current_macro = state.macros;
+
+    do {
+        if (!preprocess_eat(&state, '$')) {
+            continue;
+        }
+
+        char *macro_name = preprocess_ident(&state);
+        if (macro_name) {
+            preprocess_eat(&state, '(');
+            char *macro_arg = preprocess_ident(&state);
+            preprocess_eat(&state, ')');
+
+            if (!strcmp(macro_name, "INCLUDE")) {
+                
+            } else {
+                panic(true, "config: Unknown macro: %s\n", macro_name);
+            }
+        } else {
+            preprocess_eat(&state, '{');
+            char *macro_name = preprocess_ident(&state);
+            preprocess_eat(&state, '}');
+
+            if (state.target[0] == '=') {
+                // We are defining a macro.
+                preprocess_eat(&state, '=');
+                char *macro_value = preprocess_ident(&state);
+                struct macro *macro = ext_mem_alloc(sizeof(struct macro));
+
+                strcpy(macro->name, macro_name);
+                strcpy(macro->value, macro_value);
+                macro->next = NULL;
+
+                current_macro->next = macro;
+                current_macro = macro;
+            } else {
+                // We are using a macro.
+                struct macro *macro = state.macros;
+                while (macro) {
+                    if (!strcmp(macro->name, macro_name)) {
+                        string_push(&state.result, macro->value);
+                        break;
+                    }
+
+                    macro = macro->next;
+                }
+            }
+        }
+    } while (*state.target);
+
+    return state.result;
+}
 
 int init_config(size_t config_size) {
     config_b2sum += sizeof(CONFIG_B2SUM_SIGNATURE) - 1;
@@ -178,146 +327,9 @@ int init_config(size_t config_size) {
         }
     }
 
-    // Load macros
-    struct macro *arch_macro = ext_mem_alloc(sizeof(struct macro));
-    strcpy(arch_macro->name, "ARCH");
-#if defined (__x86_64__)
-    strcpy(arch_macro->value, "x86-64");
-#elif defined (__i386__)
-    {
-    uint32_t eax, ebx, ecx, edx;
-    if (!cpuid(0x80000001, 0, &eax, &ebx, &ecx, &edx) || !(edx & (1 << 29))) {
-        strcpy(arch_macro->value, "ia-32");
-    } else {
-        strcpy(arch_macro->value, "x86-64");
-    }
-    }
-#elif defined (__aarch64__)
-    strcpy(arch_macro->value, "aarch64");
-#elif defined (__riscv64)
-    strcpy(arch_macro->value, "riscv64");
-#else
-#error "Unspecified architecture"
-#endif
-    arch_macro->next = macros;
-    macros = arch_macro;
-
-    for (size_t i = 0; i < config_size;) {
-        if ((config_size - i >= 3 && memcmp(config_addr + i, "\n${", 3) == 0)
-         || (config_size - i >= 2 && i == 0 && memcmp(config_addr, "${", 2) == 0)) {
-            struct macro *macro = ext_mem_alloc(sizeof(struct macro));
-
-            i += i ? 3 : 2;
-            size_t j;
-            for (j = 0; config_addr[i] != '}' && config_addr[i] != '\n' && config_addr[i] != 0; j++, i++) {
-                macro->name[j] = config_addr[i];
-            }
-
-            if (config_addr[i] == '\n' || config_addr[i] == 0 || config_addr[i+1] != '=') {
-                continue;
-            }
-            i += 2;
-
-            macro->name[j] = 0;
-
-            for (j = 0; config_addr[i] != '\n' && config_addr[i] != 0; j++, i++) {
-                macro->value[j] = config_addr[i];
-            }
-            macro->value[j] = 0;
-
-            macro->next = macros;
-            macros = macro;
-
-            continue;
-        }
-
-        i++;
-    }
-
-    // Expand macros
-    if (macros != NULL) {
-        size_t new_config_size = config_size * 4;
-        char *new_config = ext_mem_alloc(new_config_size);
-
-        size_t i, in;
-        for (i = 0, in = 0; i < config_size;) {
-            if ((config_size - i >= 3 && memcmp(config_addr + i, "\n${", 3) == 0)
-             || (config_size - i >= 2 && i == 0 && memcmp(config_addr, "${", 2) == 0)) {
-                size_t orig_i = i;
-                i += i ? 3 : 2;
-                while (config_addr[i++] != '}') {
-                    if (i >= config_size) {
-                        bad_config = true;
-                        panic(true, "config: Malformed macro usage");
-                    }
-                }
-                if (config_addr[i] != '=') {
-                    i = orig_i;
-                    goto next;
-                }
-                continue;
-            }
-
-next:
-            if (config_size - i >= 2 && memcmp(config_addr + i, "${", 2) == 0) {
-                char *macro_name = ext_mem_alloc(1024);
-                i += 2;
-                size_t j;
-                for (j = 0; config_addr[i] != '}' && config_addr[i] != '\n' && config_addr[i] != 0; j++, i++) {
-                    macro_name[j] = config_addr[i];
-                }
-                if (config_addr[i] != '}') {
-                    bad_config = true;
-                    panic(true, "config: Malformed macro usage");
-                }
-                i++;
-                macro_name[j] = 0;
-                char *macro_value = "";
-                struct macro *macro = macros;
-                for (;;) {
-                    if (macro == NULL) {
-                        break;
-                    }
-                    if (strcmp(macro->name, macro_name) == 0) {
-                        macro_value = macro->value;
-                        break;
-                    }
-                    macro = macro->next;
-                }
-                pmm_free(macro_name, 1024);
-                for (j = 0; macro_value[j] != 0; j++, in++) {
-                    if (in >= new_config_size) {
-                        goto overflow;
-                    }
-                    new_config[in] = macro_value[j];
-                }
-                continue;
-            }
-
-            if (in >= new_config_size) {
-overflow:
-                bad_config = true;
-                panic(true, "config: Macro-induced buffer overflow");
-            }
-            new_config[in++] = config_addr[i++];
-        }
-
-        pmm_free(config_addr, config_size);
-
-        config_addr = new_config;
-        config_size = in;
-
-        // Free macros
-        struct macro *macro = macros;
-        for (;;) {
-            if (macro == NULL) {
-                break;
-            }
-            struct macro *next = macro->next;
-            pmm_free(macro, sizeof(struct macro));
-            macro = next;
-        }
-    }
+    char *new_config = preprocess(config_addr);
+    config_addr = new_config;
+    config_size = strlen(config_addr);
 
     config_ready = true;
 

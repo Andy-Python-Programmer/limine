@@ -58,7 +58,8 @@ override CFLAGS += \
     -fPIE \
     -I../freestanding-headers \
     -I. \
-    -D_LIMINE_PROTO
+    -D_LIMINE_PROTO \
+    -mgeneral-regs-only
 
 ifneq ($(findstring x86_64,$(CC_FOR_TARGET)),)
 override CFLAGS += \
