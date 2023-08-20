@@ -186,7 +186,7 @@ struct preprocessor_state {
     struct macro *macros;
 };
 
-bool preprocess_eat(struct preprocessor_state *state, char token) {
+bool preprocess_eat_until(struct preprocessor_state *state, char token) {
     do {
         char tok = *state->target;
         char c[] = { tok, 0 };
@@ -200,6 +200,17 @@ bool preprocess_eat(struct preprocessor_state *state, char token) {
     } while (*(state->target)++);
 
     return false;
+}
+
+/// Consumes the current token if it matches `token`. Otherwise, panics.
+void preprocess_eat(struct preprocessor_state *state, char token) {
+    char current_token = state->target[0];
+
+    if (current_token != token) {
+        panic(true, "config: Expected '%c', got '%c'", token, current_token);
+    } else {
+        state->target++;
+    }
 }
 
 char *preprocess_ident(struct preprocessor_state *state) {
@@ -226,65 +237,82 @@ char *preprocess_ident(struct preprocessor_state *state) {
     return ident_str;
 }
 
+static struct macro *macros = NULL;
+static struct macro *current_macro;
+
 /// The caller is responsible for deallocating the returned string (via `pmm_free`).
 char *preprocess(char *target) {
+    if (macros == NULL) {
+        macros = ext_mem_alloc(sizeof(struct macro));
+
+        strcpy(macros->name, "ARCH");
+        strcpy(macros->value, "x86_64");
+        macros->next = NULL;
+        current_macro = macros;
+    }
+
     size_t target_len = strlen(target);
     struct preprocessor_state state = {
         .target = target,
         .result = string_new(),
-        .macros = ext_mem_alloc(sizeof(struct macro))
     };
 
-    strcpy(state.macros->name, "ARCH");
-    strcpy(state.macros->value, "x86_64");
-    state.macros->next = NULL;
-
-    struct macro *current_macro = state.macros;
-
     do {
-        if (!preprocess_eat(&state, '$')) {
+        if (!preprocess_eat_until(&state, '$')) {
             continue;
         }
 
+        preprocess_eat(&state, '{');
         char *macro_name = preprocess_ident(&state);
-        if (macro_name) {
-            preprocess_eat(&state, '(');
+        if (state.target[0] == '(') {
+            state.target++;
+
+            // Macro function.
             char *macro_arg = preprocess_ident(&state);
             preprocess_eat(&state, ')');
 
             if (!strcmp(macro_name, "INCLUDE")) {
-                
-            } else {
-                panic(true, "config: Unknown macro: %s\n", macro_name);
-            }
-        } else {
-            preprocess_eat(&state, '{');
-            char *macro_name = preprocess_ident(&state);
-            preprocess_eat(&state, '}');
-
-            if (state.target[0] == '=') {
-                // We are defining a macro.
-                preprocess_eat(&state, '=');
-                char *macro_value = preprocess_ident(&state);
-                struct macro *macro = ext_mem_alloc(sizeof(struct macro));
-
-                strcpy(macro->name, macro_name);
-                strcpy(macro->value, macro_value);
-                macro->next = NULL;
-
-                current_macro->next = macro;
-                current_macro = macro;
-            } else {
-                // We are using a macro.
-                struct macro *macro = state.macros;
-                while (macro) {
-                    if (!strcmp(macro->name, macro_name)) {
-                        string_push(&state.result, macro->value);
-                        break;
-                    }
-
-                    macro = macro->next;
+                struct file_handle *file = uri_open(macro_arg);
+                if (file == NULL) {
+                    panic(true, "config: Failed to include file '%s'", macro_arg);
                 }
+
+                char *contents = freadall(file, MEMMAP_BOOTLOADER_RECLAIMABLE);
+                char *final = preprocess(contents);
+                string_push(&state.result, final);
+                // TODO(andypython): destroy `final` and `contents`.
+            } else {
+                panic(true, "config: Unknown macro function '%s'", macro_name);
+            }
+
+            preprocess_eat(&state, '}');
+            continue;
+        } 
+        
+        preprocess_eat(&state, '}');
+
+        if (state.target[0] == '=') {
+            // We are defining a macro.
+            preprocess_eat(&state, '=');
+            char *macro_value = preprocess_ident(&state);
+            struct macro *macro = ext_mem_alloc(sizeof(struct macro));
+
+            strcpy(macro->name, macro_name);
+            strcpy(macro->value, macro_value);
+            macro->next = NULL;
+
+            current_macro->next = macro;
+            current_macro = macro;
+        } else {
+            // We are using a macro.
+            struct macro *macro = macros;
+            while (macro) {
+                if (!strcmp(macro->name, macro_name)) {
+                    string_push(&state.result, macro->value);
+                    break;
+                }
+
+                macro = macro->next;
             }
         }
     } while (*state.target);
